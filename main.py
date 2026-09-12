@@ -943,4 +943,344 @@ async def text(
                     "Example:\n"
                     "<code>100.50 99.80 102.00</code>"
                 ),
-                parse_mo
+                parse_mode="HTML"
+            )
+
+            return
+
+        try:
+
+            entry, sl, tp = map(
+                float,
+                p
+            )
+
+        except ValueError:
+
+            await update.message.reply_text(
+                (
+                    "❌ Invalid values.\n\n"
+                    "Example:\n"
+                    "<code>100.50 99.80 102.00</code>"
+                ),
+                parse_mode="HTML"
+            )
+
+            return
+
+        s = SESSIONS.get(uid)
+
+        if not s:
+
+            WAITING.pop(
+                uid,
+                None
+            )
+
+            await update.message.reply_text(
+                (
+                    "⚠️ No active session found.\n"
+                    "Please start a new session."
+                ),
+                reply_markup=menu()
+            )
+
+            return
+
+        action = LAST_SIGNAL.get(
+            uid,
+            {}
+        ).get(
+            "action",
+            "WAIT"
+        )
+
+        if action not in (
+            "BUY",
+            "SELL"
+        ):
+
+            action = "REFERENCE"
+
+        s["trade"] = {
+            "direction": action,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "started_at": datetime.now(
+                timezone.utc
+            ).isoformat()
+        }
+
+        WAITING.pop(
+            uid,
+            None
+        )
+
+        await update.message.reply_text(
+            (
+                "💼 <b>MONITORING ACTIVATED</b>\n\n"
+                f"Asset: <b>{s['asset']}</b>\n"
+                f"Direction: <b>{action}</b>\n\n"
+                f"Entry: <code>{entry}</code>\n"
+                f"Stop Loss: <code>{sl}</code>\n"
+                f"Target: <code>{tp}</code>\n\n"
+                "🔎 Monitoring is now active.\n"
+                "🔄 Gemini will continue analyzing "
+                "market data and supplied news."
+            ),
+            parse_mode="HTML",
+            reply_markup=trade_buttons()
+        )
+
+        return
+
+
+async def button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    q = update.callback_query
+
+    await q.answer()
+
+    uid = q.from_user.id
+
+    if uid not in AUTH:
+
+        await q.message.reply_text(
+            "🔒 Authenticate with /start first."
+        )
+
+        return
+
+    d = q.data
+
+    if d == "start":
+
+        WAITING[uid] = "budget"
+
+        await q.message.reply_text(
+            (
+                "💰 <b>Session Budget</b>\n\n"
+                "Enter the budget in INR."
+            ),
+            parse_mode="HTML"
+        )
+
+    elif d == "stop":
+
+        SESSIONS.pop(
+            uid,
+            None
+        )
+
+        WAITING.pop(
+            uid,
+            None
+        )
+
+        await q.message.reply_text(
+            "⏹ <b>Session stopped.</b>",
+            parse_mode="HTML",
+            reply_markup=menu()
+        )
+
+    elif d == "status":
+
+        s = SESSIONS.get(uid)
+
+        if s:
+
+            await q.message.reply_text(
+                (
+                    "📋 <b>SESSION</b>\n\n"
+                    f"Asset: {s['asset']}\n"
+                    f"Budget: ₹{s['budget']:,.2f}\n"
+                    f"Risk: {s['risk']:.2f}%\n"
+                    f"Active Trade: "
+                    f"{'YES' if s.get('trade') else 'NO'}"
+                ),
+                parse_mode="HTML",
+                reply_markup=menu()
+            )
+
+        else:
+
+            await q.message.reply_text(
+                "No active session.",
+                reply_markup=menu()
+            )
+
+    elif d == "active":
+
+        s = SESSIONS.get(uid)
+
+        if s and s.get("trade"):
+
+            t = s["trade"]
+
+            await q.message.reply_text(
+                (
+                    "💼 <b>ACTIVE TRADE</b>\n\n"
+                    f"Asset: {s['asset']}\n"
+                    f"Direction: {t['direction']}\n"
+                    f"Entry: {t['entry']}\n"
+                    f"SL: {t['sl']}\n"
+                    f"TP: {t['tp']}"
+                ),
+                parse_mode="HTML",
+                reply_markup=trade_buttons()
+            )
+
+        else:
+
+            await q.message.reply_text(
+                "No active trade."
+            )
+
+    elif d == "help":
+
+        await q.message.reply_text(
+            (
+                "📚 <b>SPARKS FOREX AI</b>\n\n"
+                "Market data and supplied news are "
+                "analyzed using Google Gemini.\n\n"
+                "The analyzer evaluates market direction, "
+                "confidence, risk and potential setups.\n\n"
+                "No MT5 connection is required."
+            ),
+            parse_mode="HTML"
+        )
+
+    elif d.startswith("asset|"):
+
+        asset = d.split(
+            "|",
+            1
+        )[1]
+
+        if asset not in ASSETS:
+            return
+
+        context.user_data[
+            "asset"
+        ] = asset
+
+        WAITING[uid] = "risk"
+
+        await q.message.reply_text(
+            (
+                "⚠️ <b>Risk Rate</b>\n\n"
+                "Enter maximum risk per trade, "
+                "e.g. <code>1</code>."
+            ),
+            parse_mode="HTML"
+        )
+
+    elif d == "taken":
+
+        if uid in SESSIONS:
+
+            WAITING[uid] = "trade"
+
+            await q.message.reply_text(
+                (
+                    "💼 <b>Monitoring Reference</b>\n\n"
+                    "Send:\n"
+                    "<code>entry stop_loss target</code>"
+                ),
+                parse_mode="HTML"
+            )
+
+    elif d == "not_taken":
+
+        await q.message.reply_text(
+            "🔎 Continuing to scan for new setups."
+        )
+
+    elif d == "stop_trade":
+
+        if uid in SESSIONS:
+
+            SESSIONS[uid]["trade"] = None
+
+        await q.message.reply_text(
+            (
+                "🛑 Trade monitoring stopped.\n"
+                "New-signal scanning resumed."
+            ),
+            reply_markup=menu()
+        )
+
+    elif d == "refresh":
+
+        await analyze_user(
+            uid,
+            context,
+            True
+        )
+
+
+async def minute_job(
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    for uid in list(SESSIONS):
+
+        await analyze_user(
+            uid,
+            context
+        )
+
+
+def main():
+
+    check_config()
+
+    app = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            text
+        )
+    )
+
+    app.job_queue.run_repeating(
+        minute_job,
+        interval=INTERVAL,
+        first=INTERVAL
+    )
+
+    log.info(
+        "Sparks Forex Gemini AI Market Analyzer started."
+    )
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+if __name__ == "__main__":
+    main()
