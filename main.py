@@ -1,15 +1,16 @@
 import asyncio
 import hashlib
 import hmac
-import json
 import logging
 import os
+import json
 import urllib.parse
 from datetime import datetime, timezone
 
 import feedparser
 import httpx
 import yfinance as yf
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -20,6 +21,10 @@ from telegram.ext import (
     filters,
 )
 
+from google import genai
+from google.genai import types
+
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
@@ -28,34 +33,48 @@ logging.basicConfig(
 log = logging.getLogger("sparks-forex")
 
 
-# ============================================================
-# RAILWAY VARIABLES
-# ============================================================
+BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
-MODEL = os.getenv("XAI_MODEL", "grok-4.6").strip()
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY",
+    ""
+).strip()
 
-CHANNEL_ID = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
+MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash"
+).strip()
 
-INTERVAL = int(os.getenv("UPDATE_INTERVAL_SECONDS", "60"))
-NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "5"))
+CHANNEL_ID = os.getenv(
+    "SIGNAL_CHANNEL_ID",
+    ""
+).strip()
+
+INTERVAL = int(
+    os.getenv(
+        "UPDATE_INTERVAL_SECONDS",
+        "60"
+    )
+)
+
+NEWS_LIMIT = int(
+    os.getenv(
+        "NEWS_LIMIT",
+        "5"
+    )
+)
 
 
-# ============================================================
-# FIXED ACCESS PASSWORD
+# Fixed access password is hashed, not stored as plaintext.
 # Password: Sparks@7421
-# ============================================================
-
 PASSWORD_HASH = (
     "537061726b73466978656453616c742d7631:"
     "a537bae5e0dd4994779782c709a117f1de89ba86b0ad1644838ba18e8f16ac92"
 )
 
-
-# ============================================================
-# SUPPORTED ASSETS
-# ============================================================
 
 ASSETS = {
     "BTC/USDT": "BTC-USD",
@@ -72,98 +91,82 @@ ASSETS = {
 }
 
 
-# ============================================================
-# MEMORY
-# ============================================================
-
 AUTH = set()
 WAITING = {}
 SESSIONS = {}
-LAST_ANALYSIS = {}
+LAST_SIGNAL = {}
 
-
-# ============================================================
-# CONFIG CHECK
-# ============================================================
 
 def check_config():
     missing = [
         x
         for x, v in {
             "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
-            "XAI_API_KEY": XAI_API_KEY,
+            "GEMINI_API_KEY": GEMINI_API_KEY,
         }.items()
         if not v
     ]
 
     if missing:
         raise RuntimeError(
-            "Missing Railway variables: " + ", ".join(missing)
+            "Missing Railway variables: "
+            + ", ".join(missing)
         )
 
 
-# ============================================================
-# PASSWORD
-# ============================================================
-
 def password_ok(value):
     try:
-        salt_hex, hash_hex = PASSWORD_HASH.split(":", 1)
+        salt_hex, hash_hex = PASSWORD_HASH.split(
+            ":",
+            1
+        )
 
         actual = hashlib.pbkdf2_hmac(
             "sha256",
             value.encode(),
             bytes.fromhex(salt_hex),
-            210_000,
+            210_000
         )
 
         return hmac.compare_digest(
             actual,
-            bytes.fromhex(hash_hex),
+            bytes.fromhex(hash_hex)
         )
 
     except Exception:
         return False
 
 
-# ============================================================
-# MAIN MENU
-# ============================================================
-
 def menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "📊 Start Session",
-                callback_data="start",
+                callback_data="start"
             ),
             InlineKeyboardButton(
                 "⏹ Stop Session",
-                callback_data="stop",
-            ),
+                callback_data="stop"
+            )
         ],
         [
             InlineKeyboardButton(
                 "💼 Active Trade",
-                callback_data="active",
+                callback_data="active"
             ),
             InlineKeyboardButton(
                 "📋 Status",
-                callback_data="status",
-            ),
+                callback_data="status"
+            )
         ],
         [
             InlineKeyboardButton(
                 "ℹ️ Help",
-                callback_data="help",
-            ),
+                callback_data="help"
+            )
         ],
     ])
 
-
-# ============================================================
-# ASSET MENU
-# ============================================================
 
 def assets_menu():
     rows = []
@@ -173,7 +176,7 @@ def assets_menu():
         row.append(
             InlineKeyboardButton(
                 name,
-                callback_data="asset|" + name,
+                callback_data="asset|" + name
             )
         )
 
@@ -187,28 +190,35 @@ def assets_menu():
     return InlineKeyboardMarkup(rows)
 
 
-# ============================================================
-# MONITORING BUTTONS
-# ============================================================
+def signal_buttons():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ TRADE TAKEN",
+                callback_data="taken"
+            ),
+            InlineKeyboardButton(
+                "❌ TRADE NOT TAKEN",
+                callback_data="not_taken"
+            )
+        ]
+    ])
+
 
 def trade_buttons():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "🛑 STOP MONITORING",
-                callback_data="stop_trade",
+                "🛑 STOP TRADE",
+                callback_data="stop_trade"
             ),
             InlineKeyboardButton(
                 "🔄 REFRESH",
-                callback_data="refresh",
-            ),
+                callback_data="refresh"
+            )
         ]
     ])
 
-
-# ============================================================
-# MARKET SNAPSHOT
-# ============================================================
 
 def snapshot(asset):
     ticker = ASSETS[asset]
@@ -219,64 +229,104 @@ def snapshot(asset):
         interval="1h",
         progress=False,
         auto_adjust=False,
-        threads=False,
+        threads=False
     )
 
     if df is None or df.empty:
-        raise RuntimeError("No market data available.")
+        raise RuntimeError(
+            "No market data available."
+        )
 
-    if getattr(df.columns, "nlevels", 1) > 1:
+    if getattr(
+        df.columns,
+        "nlevels",
+        1
+    ) > 1:
+
         try:
             df = df.xs(
                 ticker,
                 axis=1,
-                level=-1,
+                level=-1
             )
+
         except Exception:
-            df.columns = df.columns.get_level_values(0)
+            df.columns = (
+                df.columns
+                .get_level_values(0)
+            )
 
     close = df["Close"].dropna()
     high = df["High"].dropna()
     low = df["Low"].dropna()
 
     if len(close) < 55:
-        raise RuntimeError("Not enough candles.")
+        raise RuntimeError(
+            "Not enough candles."
+        )
 
     delta = close.diff()
 
     gain = (
-        delta.clip(lower=0)
+        delta
+        .clip(lower=0)
         .rolling(14)
         .mean()
     )
 
     loss = (
-        -delta.clip(upper=0)
-    ).rolling(14).mean()
+        -delta
+        .clip(upper=0)
+        .rolling(14)
+        .mean()
+    )
 
     rs = gain / loss.replace(
         0,
-        float("nan"),
+        float("nan")
     )
 
     rsi = float(
-        (100 - (100 / (1 + rs))).iloc[-1]
+        (
+            100
+            - (
+                100
+                / (1 + rs)
+            )
+        ).iloc[-1]
     )
 
     ret = close.pct_change().dropna()
 
     return {
-        "price": float(close.iloc[-1]),
-        "change": float(
-            (close.iloc[-1] / close.iloc[-2] - 1) * 100
+        "price": float(
+            close.iloc[-1]
         ),
-        "high": float(high.iloc[-1]),
-        "low": float(low.iloc[-1]),
+        "change": float(
+            (
+                close.iloc[-1]
+                / close.iloc[-2]
+                - 1
+            )
+            * 100
+        ),
+        "high": float(
+            high.iloc[-1]
+        ),
+        "low": float(
+            low.iloc[-1]
+        ),
         "sma20": float(
-            close.rolling(20).mean().iloc[-1]
+            close
+            .rolling(20)
+            .mean()
+            .iloc[-1]
         ),
         "sma50": float(
-            close.rolling(50).mean().iloc[-1]
+            close
+            .rolling(50)
+            .mean()
+            .iloc[-1]
         ),
         "rsi": rsi,
         "volatility": float(
@@ -285,47 +335,46 @@ def snapshot(asset):
     }
 
 
-# ============================================================
-# NEWS
-# ============================================================
-
 def get_news(asset):
-    query = urllib.parse.quote(
+    q = urllib.parse.quote(
         asset + " market"
     )
 
     url = (
         "https://news.google.com/rss/search"
-        f"?q={query}&hl=en-US&gl=US&ceid=US:en"
+        f"?q={q}&hl=en-US&gl=US&ceid=US:en"
     )
 
     try:
-        response = httpx.get(
+        r = httpx.get(
             url,
             headers={
-                "User-Agent": "Sparks-Forex/1.0"
+                "User-Agent":
+                "Sparks-Forex/1.0"
             },
-            timeout=10,
+            timeout=10
         )
 
-        response.raise_for_status()
+        r.raise_for_status()
 
         feed = feedparser.parse(
-            response.text
+            r.text
         )
 
         return [
             {
-                "title": entry.get(
+                "title": e.get(
                     "title",
-                    "",
+                    ""
                 ),
-                "published": entry.get(
+                "published": e.get(
                     "published",
-                    "",
-                ),
+                    ""
+                )
             }
-            for entry in feed.entries[:NEWS_LIMIT]
+            for e in feed.entries[
+                :NEWS_LIMIT
+            ]
         ]
 
     except Exception:
@@ -333,317 +382,354 @@ def get_news(asset):
 
 
 # ============================================================
-# GROK ANALYSIS
+# GEMINI AI
 # ============================================================
 
 async def ai_analyze(
     asset,
     snap,
     news,
-    session,
+    session
 ):
-    active = session.get("trade")
 
-    market_direction = (
-        "BULLISH"
-        if snap["sma20"] > snap["sma50"]
-        else "BEARISH"
+    active = session.get(
+        "trade"
     )
 
-    analysis_input = {
+    prompt = {
         "asset": asset,
         "market": snap,
-        "technical_direction": market_direction,
         "news": news,
-        "active_trade": active,
+        "session_budget": session[
+            "budget"
+        ],
+        "risk_percent": session[
+            "risk"
+        ],
+        "active_trade": active
     }
 
-    instructions = f"""
-You are Sparks Market Analysis AI.
+    instructions = """
+You are an analytical market assistant.
 
-Your task is ONLY to determine whether the currently observed market trend
-is likely to continue based on the supplied market data and supplied news.
+Analyze the supplied market data and supplied news only.
 
-Do not claim certainty.
-Do not invent news.
-Do not use information that was not supplied.
-Do not execute trades.
-Do not give financial instructions.
+If an active trade exists, prioritize monitoring it.
+
+Never claim certainty.
+Never invent news.
+Never claim guaranteed future movement.
 
 Return ONLY valid JSON.
+Do not use markdown.
+Do not wrap the response in ```.
 
-Required JSON structure:
+Use exactly this structure:
 
-{{
-  "trend_continues": "YES or NO",
+{
+  "action": "BUY | SELL | WAIT | HOLD | EXIT_WATCH",
   "confidence": 0,
-  "trend": "BULLISH or BEARISH or MIXED",
+  "entry_reference": 0,
+  "stop_loss_reference": 0,
+  "target_reference": 0,
+  "risk_level": "LOW | MEDIUM | HIGH",
+  "suggested_amount": 0,
   "summary": "",
-  "market_factors": "",
-  "news_factors": "",
-  "risk_note": ""
-}}
+  "trade_management": ""
+}
 
 Rules:
 
-1. trend_continues must be exactly YES or NO.
-2. confidence must be a number from 0 to 100.
-3. Consider price change, SMA20, SMA50, RSI and volatility.
-4. Consider the supplied news and whether it supports or conflicts with
-   the observed trend.
-5. If technical and news evidence conflict strongly, prefer NO.
-6. If evidence is weak or mixed, use NO.
-7. Never invent a headline or event.
-8. Keep the response concise.
-9. Explain WHY the answer is YES or NO.
-10. The answer is an analysis, not a guarantee.
+1. BUY means the supplied evidence suggests a potential bullish setup.
+2. SELL means the supplied evidence suggests a potential bearish setup.
+3. WAIT means evidence is weak, mixed, or unclear.
+4. HOLD means an existing monitored trade still appears acceptable.
+5. EXIT_WATCH means an existing monitored trade has deteriorating conditions.
+6. Confidence must be between 0 and 100.
+7. Suggested amount must not exceed the session budget.
+8. Consider price, SMA20, SMA50, RSI and volatility.
+9. Consider supplied news as supporting or conflicting evidence.
+10. Do not invent or assume news.
+11. Keep explanations concise.
+12. BUY/SELL are analytical outputs only and are not guarantees.
+13. If technical evidence and news conflict strongly, reduce confidence or use WAIT.
 
 DATA:
 
-{json.dumps(analysis_input, ensure_ascii=False)}
-"""
+%s
+""" % json.dumps(
+        prompt,
+        ensure_ascii=False
+    )
 
-    headers = {
-        "Authorization": "Bearer " + XAI_API_KEY,
-        "Content-Type": "application/json",
-    }
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
 
-    body = {
-        "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a careful market-analysis assistant. "
-                    "Return only valid JSON."
-                ),
-            },
-            {
-                "role": "user",
-                "content": instructions,
-            },
-        ],
-        "temperature": 0.2,
-    }
-
-    async with httpx.AsyncClient(
-        timeout=45
-    ) as client:
-
-        response = await client.post(
-            "https://api.x.ai/v1/chat/completions",
-            headers=headers,
-            json=body,
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=MODEL,
+        contents=instructions,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            response_mime_type="application/json"
         )
-
-        response.raise_for_status()
-
-        data = response.json()
+    )
 
     content = (
-        data["choices"][0]["message"]["content"]
-        .strip()
-    )
+        response.text or ""
+    ).strip()
+
+    if not content:
+        raise RuntimeError(
+            "Gemini returned an empty response."
+        )
 
     if content.startswith("```"):
         content = (
             content
-            .replace("```json", "")
-            .replace("```", "")
+            .replace(
+                "```json",
+                ""
+            )
+            .replace(
+                "```",
+                ""
+            )
             .strip()
         )
 
-    result = json.loads(content)
-
-    trend_continues = str(
-        result.get(
-            "trend_continues",
-            "NO",
-        )
-    ).upper()
-
-    if trend_continues not in (
-        "YES",
-        "NO",
-    ):
-        trend_continues = "NO"
-
-    result["trend_continues"] = (
-        trend_continues
+    result = json.loads(
+        content
     )
 
     result["confidence"] = float(
         result.get(
             "confidence",
-            0,
+            0
         )
     )
 
-    result["confidence"] = max(
-        0,
-        min(
-            100,
-            result["confidence"],
-        ),
+    result["suggested_amount"] = float(
+        result.get(
+            "suggested_amount",
+            0
+        )
     )
 
     return result
 
 
-# ============================================================
-# FORMAT ANALYSIS
-# ============================================================
-
-def analysis_text(
+def channel_signal(
     asset,
-    snap,
-    result,
+    result
 ):
-    trend = result.get(
-        "trend",
-        "MIXED",
-    )
 
-    continuation = result.get(
-        "trend_continues",
-        "NO",
-    )
-
-    confidence = result.get(
-        "confidence",
-        0,
-    )
-
-    summary = result.get(
-        "summary",
-        "No strong conclusion.",
-    )
-
-    market_factors = result.get(
-        "market_factors",
-        "",
-    )
-
-    news_factors = result.get(
-        "news_factors",
-        "",
-    )
-
-    risk_note = result.get(
-        "risk_note",
-        "",
+    action = result.get(
+        "action",
+        "WAIT"
     )
 
     return (
-        "📊 <b>MARKET ANALYSIS</b>\n\n"
-        f"Asset: <b>{asset}</b>\n"
-        f"Price: <b>{snap['price']:.6g}</b>\n"
-        f"Change: <b>{snap['change']:+.2f}%</b>\n\n"
-        f"Trend: <b>{trend}</b>\n"
-        f"Trend Continuation: "
-        f"<b>{continuation}</b>\n"
-        f"Confidence: "
-        f"<b>{confidence:.0f}%</b>\n\n"
-        f"🧠 <b>Summary</b>\n"
-        f"{summary}\n\n"
-        f"📈 <b>Market Factors</b>\n"
-        f"{market_factors}\n\n"
-        f"📰 <b>News Factors</b>\n"
-        f"{news_factors}\n\n"
-        f"⚠️ <b>Risk Note</b>\n"
-        f"{risk_note}"
+        f"🚨 <b>{asset} — {action}</b>\n\n"
+        f"Entry: <code>"
+        f"{result.get('entry_reference', 0)}"
+        f"</code>\n"
+        f"SL: <code>"
+        f"{result.get('stop_loss_reference', 0)}"
+        f"</code>\n"
+        f"TP: <code>"
+        f"{result.get('target_reference', 0)}"
+        f"</code>\n\n"
+        f"Risk: <b>"
+        f"{result.get('risk_level', 'UNKNOWN')}"
+        f"</b>\n"
+        f"Confidence: <b>"
+        f"{result.get('confidence', 0):.0f}%"
+        f"</b>\n\n"
+        "AI MARKET ANALYZER"
     )
 
-
-# ============================================================
-# ANALYZE USER
-# ============================================================
 
 async def analyze_user(
     uid,
     context,
-    force=False,
+    force=False
 ):
-    session = SESSIONS.get(uid)
 
-    if not session:
+    s = SESSIONS.get(uid)
+
+    if not s:
         return
 
     try:
+
         snap = await asyncio.to_thread(
             snapshot,
-            session["asset"],
+            s["asset"]
         )
 
         news = await asyncio.to_thread(
             get_news,
-            session["asset"],
+            s["asset"]
         )
 
         result = await ai_analyze(
-            session["asset"],
+            s["asset"],
             snap,
             news,
-            session,
+            s
         )
 
-        LAST_ANALYSIS[uid] = result
+        LAST_SIGNAL[uid] = result
 
-        # ----------------------------------------------------
-        # ACTIVE MONITORING
-        # ----------------------------------------------------
+        if s.get("trade"):
 
-        if session.get("trade"):
-            trade = session["trade"]
+            t = s["trade"]
 
             text = (
-                "💼 <b>ACTIVE MONITORING UPDATE</b>\n\n"
-                f"Asset: <b>{session['asset']}</b>\n"
-                f"Reference Direction: "
-                f"<b>{trade['direction']}</b>\n"
-                f"Entry: <code>{trade['entry']}</code>\n"
-                f"SL: <code>{trade['sl']}</code>\n"
-                f"TP: <code>{trade['tp']}</code>\n\n"
-                f"Current Price: "
-                f"<b>{snap['price']:.6g}</b>\n"
-                f"Trend: "
-                f"<b>{result.get('trend', 'MIXED')}</b>\n"
-                f"Trend Continuation: "
-                f"<b>{result.get('trend_continues', 'NO')}</b>\n"
-                f"Confidence: "
-                f"<b>{result.get('confidence', 0):.0f}%</b>\n\n"
+                "💼 <b>ACTIVE TRADE UPDATE</b>\n\n"
+                f"Asset: <b>{s['asset']}</b>\n"
+                f"Direction: <b>{t['direction']}</b>\n"
+                f"Entry: <code>{t['entry']}</code>\n"
+                f"SL: <code>{t['sl']}</code>\n"
+                f"TP: <code>{t['tp']}</code>\n\n"
+                f"Current Price: <b>"
+                f"{snap['price']:.6g}"
+                f"</b>\n"
+                f"Decision: <b>"
+                f"{result.get('action','HOLD')}"
+                f"</b>\n"
+                f"Risk: <b>"
+                f"{result.get('risk_level','UNKNOWN')}"
+                f"</b>\n"
+                f"Confidence: <b>"
+                f"{result.get('confidence',0):.0f}%"
+                f"</b>\n\n"
                 f"🧠 "
-                f"{result.get('summary', '')}\n\n"
-                f"Management note: "
-                f"{result.get('risk_note', '')}"
+                f"{result.get('summary','')}\n\n"
+                f"Management: "
+                f"{result.get('trade_management','Monitor the position.')}"
             )
 
             await context.bot.send_message(
                 uid,
                 text,
                 parse_mode="HTML",
-                reply_markup=trade_buttons(),
+                reply_markup=trade_buttons()
             )
 
-        # ----------------------------------------------------
-        # NORMAL ANALYSIS
-        # ----------------------------------------------------
+        elif result.get(
+            "action"
+        ) in (
+            "BUY",
+            "SELL"
+        ):
+
+            amount = min(
+                max(
+                    0,
+                    result.get(
+                        "suggested_amount",
+                        s["budget"]
+                        * s["risk"]
+                        / 100
+                    )
+                ),
+                s["budget"]
+            )
+
+            text = (
+                "🚨 <b>SIGNAL DETECTED</b>\n\n"
+                f"Asset: <b>{s['asset']}</b>\n"
+                f"Direction: <b>{result['action']}</b>\n"
+                f"Entry: <code>"
+                f"{result.get('entry_reference',0)}"
+                f"</code>\n"
+                f"SL: <code>"
+                f"{result.get('stop_loss_reference',0)}"
+                f"</code>\n"
+                f"TP: <code>"
+                f"{result.get('target_reference',0)}"
+                f"</code>\n"
+                f"Risk: <b>"
+                f"{s['risk']:.2f}%"
+                f"</b>\n"
+                f"Suggested Amount: <b>"
+                f"₹{amount:,.2f}"
+                f"</b>\n"
+                f"Risk Level: <b>"
+                f"{result.get('risk_level','UNKNOWN')}"
+                f"</b>\n"
+                f"Confidence: <b>"
+                f"{result.get('confidence',0):.0f}%"
+                f"</b>\n\n"
+                f"🧠 "
+                f"{result.get('summary','')}"
+            )
+
+            await context.bot.send_message(
+                uid,
+                text,
+                parse_mode="HTML",
+                reply_markup=signal_buttons()
+            )
+
+            if CHANNEL_ID:
+
+                try:
+
+                    await context.bot.send_message(
+                        int(CHANNEL_ID),
+                        channel_signal(
+                            s["asset"],
+                            result
+                        ),
+                        parse_mode="HTML"
+                    )
+
+                except Exception:
+
+                    log.exception(
+                        "Could not post signal to channel."
+                    )
 
         else:
-            text = analysis_text(
-                session["asset"],
-                snap,
-                result,
+
+            text = (
+                "📊 <b>MARKET UPDATE</b>\n\n"
+                f"Asset: <b>{s['asset']}</b>\n"
+                f"Price: <b>"
+                f"{snap['price']:.6g}"
+                f"</b>\n"
+                f"Change: <b>"
+                f"{snap['change']:+.2f}%"
+                f"</b>\n"
+                f"Trend: <b>"
+                f"{'Bullish' if snap['sma20'] > snap['sma50'] else 'Bearish'}"
+                f"</b>\n"
+                f"RSI: <b>"
+                f"{snap['rsi']:.1f}"
+                f"</b>\n"
+                f"Risk: <b>"
+                f"{s['risk']:.2f}%"
+                f"</b>\n"
+                f"Signal: <b>"
+                f"{result.get('action','WAIT')}"
+                f"</b>\n\n"
+                f"🧠 "
+                f"{result.get('summary','No strong setup right now.')}"
             )
 
             await context.bot.send_message(
                 uid,
                 text,
                 parse_mode="HTML",
-                reply_markup=menu(),
+                reply_markup=menu()
             )
 
     except Exception:
+
         log.exception(
             "Analysis failed"
         )
@@ -654,21 +740,19 @@ async def analyze_user(
                 "⚠️ <b>Analysis temporarily unavailable.</b>\n"
                 "The session remains active and will retry."
             ),
-            parse_mode="HTML",
+            parse_mode="HTML"
         )
 
 
-# ============================================================
-# /START
-# ============================================================
-
 async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
+
     uid = update.effective_user.id
 
     if uid not in AUTH:
+
         WAITING[uid] = "password"
 
         await update.message.reply_text(
@@ -676,28 +760,26 @@ async def start(
                 "🔐 <b>Authentication Required</b>\n\n"
                 "Enter your access password."
             ),
-            parse_mode="HTML",
+            parse_mode="HTML"
         )
 
     else:
+
         await update.message.reply_text(
             (
                 "🔓 <b>Authenticated.</b>\n\n"
                 "Choose an option."
             ),
             parse_mode="HTML",
-            reply_markup=menu(),
+            reply_markup=menu()
         )
 
 
-# ============================================================
-# TEXT HANDLER
-# ============================================================
-
 async def text(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
+
     uid = update.effective_user.id
 
     value = (
@@ -706,23 +788,21 @@ async def text(
 
     state = WAITING.get(uid)
 
-    # --------------------------------------------------------
-    # PASSWORD
-    # --------------------------------------------------------
-
     if state == "password":
 
         if password_ok(value):
 
             AUTH.add(uid)
-            WAITING.pop(uid, None)
+
+            WAITING.pop(
+                uid,
+                None
+            )
 
             await update.message.reply_text(
-                (
-                    "✅ <b>Authentication successful.</b>"
-                ),
+                "✅ <b>Authentication successful.</b>",
                 parse_mode="HTML",
-                reply_markup=menu(),
+                reply_markup=menu()
             )
 
         else:
@@ -733,10 +813,6 @@ async def text(
 
         return
 
-    # --------------------------------------------------------
-    # AUTH REQUIRED
-    # --------------------------------------------------------
-
     if uid not in AUTH:
 
         await update.message.reply_text(
@@ -745,15 +821,15 @@ async def text(
 
         return
 
-    # --------------------------------------------------------
-    # BUDGET
-    # --------------------------------------------------------
-
     if state == "budget":
 
         try:
+
             budget = float(
-                value.replace(",", "")
+                value.replace(
+                    ",",
+                    ""
+                )
             )
 
             if budget <= 0:
@@ -777,24 +853,22 @@ async def text(
         WAITING[uid] = "asset"
 
         await update.message.reply_text(
-            (
-                "🎯 <b>Select the main asset:</b>"
-            ),
+            "🎯 <b>Select the main asset:</b>",
             parse_mode="HTML",
-            reply_markup=assets_menu(),
+            reply_markup=assets_menu()
         )
 
         return
 
-    # --------------------------------------------------------
-    # RISK
-    # --------------------------------------------------------
-
     if state == "risk":
 
         try:
+
             risk = float(
-                value.replace("%", "")
+                value.replace(
+                    "%",
+                    ""
+                )
             )
 
             if not 0 < risk <= 10:
@@ -812,71 +886,61 @@ async def text(
             return
 
         SESSIONS[uid] = {
-            "budget": context.user_data["budget"],
-            "asset": context.user_data["asset"],
+            "budget": context.user_data[
+                "budget"
+            ],
+            "asset": context.user_data[
+                "asset"
+            ],
             "risk": risk,
-            "trade": None,
+            "trade": None
         }
 
-        WAITING.pop(uid, None)
+        WAITING.pop(
+            uid,
+            None
+        )
 
         await update.message.reply_text(
             (
-                "🔎 <b>Market scanning started.</b>\n"
-                f"Updates every {INTERVAL} seconds."
+                "🔎 <b>Signal scanning started.</b>\n"
+                "Updates every minute."
             ),
             parse_mode="HTML",
-            reply_markup=menu(),
+            reply_markup=menu()
         )
 
         await analyze_user(
             uid,
             context,
-            True,
+            True
         )
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # MONITORING REFERENCE
-    # --------------------------------------------------------
+    # ========================================================
 
     if state == "trade":
 
-        parts = (
+        p = (
             value
-            .replace(",", " ")
+            .replace(
+                ",",
+                " "
+            )
             .split()
         )
 
-        if len(parts) != 3:
+        if len(p) != 3:
 
             await update.message.reply_text(
                 (
-                    "Send reference levels:\n"
-                    "<code>entry stop_loss target</code>"
+                    "💼 <b>Monitoring Reference</b>\n\n"
+                    "Send:\n"
+                    "<code>entry stop_loss target</code>\n\n"
+                    "Example:\n"
+                    "<code>100.50 99.80 102.00</code>"
                 ),
-                parse_mode="HTML",
-            )
-
-            return
-
-        try:
-            entry, sl, tp = map(
-                float,
-                parts,
-            )
-
-        except ValueError:
-
-            await update.message.reply_text(
-                "Use three numeric values."
-            )
-
-            return
-
-        session = SESSIONS.get(uid)
-
-        if not session:
-
-            await
+                parse_mo
