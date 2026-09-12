@@ -257,7 +257,7 @@ async def ai_analyze(asset, snap, news, session):
             "summary",
             "trade_management",
         ],
-        "additionalProperties": False,
+    
     }
 
     instructions = f"""
