@@ -166,9 +166,23 @@ DATA:
         model=GEMINI_MODEL,
         contents=instructions,
         config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+    temperature=0.2,
+    response_mime_type="application/json",
+    response_schema={
+        "type": "OBJECT",
+        "properties": {
+            "action": {"type": "STRING"},
+            "entry_reference": {"type": "NUMBER"},
+            "stop_loss_reference": {"type": "NUMBER"},
+            "target_reference": {"type": "NUMBER"},
+            "risk_level": {"type": "STRING"},
+            "confidence": {"type": "NUMBER"},
+            "suggested_amount": {"type": "NUMBER"},
+            "summary": {"type": "STRING"},
+            "trade_management": {"type": "STRING"}
+        }
+    }
+),
     )
     content = (response.text or "").strip()
     if not content:
