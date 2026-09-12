@@ -1,6 +1,0 @@
-python-telegram-bot[job-queue]==22.5
-httpx>=0.27,<1
-python-dotenv>=1.0,<2
-yfinance>=0.2.66,<0.3
-feedparser>=6.0,<7
-google-genai>=1.0,<2
